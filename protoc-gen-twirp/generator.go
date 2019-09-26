@@ -277,7 +277,7 @@ func (t *twirp) generateImports(file *descriptor.FileDescriptorProto) {
 	t.P()
 	t.P(`import `, t.pkgs["jsonpb"], ` "github.com/golang/protobuf/jsonpb"`)
 	t.P(`import `, t.pkgs["proto"], ` "github.com/golang/protobuf/proto"`)
-	t.P(`import `, t.pkgs["twirp"], ` "github.com/visor-tax/twirp"`)
+	t.P(`import `, t.pkgs["twirp"], ` "github.com/twitchtv/twirp"`)
 	t.P(`import `, t.pkgs["ctxsetters"], ` "github.com/twitchtv/twirp/ctxsetters"`)
 	t.P()
 
