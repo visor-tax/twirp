@@ -872,7 +872,7 @@ func (t *twirp) generateSignature(method *descriptor.MethodDescriptorProto) stri
 	methName := methodName(method)
 	inputType := t.goTypeName(method.GetInputType())
 	outputType := t.goTypeName(method.GetOutputType())
-	return fmt.Sprintf(`	%s(%s.Context, *%s) (*%s, error)`, methName, t.pkgs["context"], inputType, outputType)
+	return fmt.Sprintf(`	%s(%s.Context, *%s) (*%s, twirp.Error)`, methName, t.pkgs["context"], inputType, outputType)
 }
 
 // valid names: 'JSON', 'Protobuf'
