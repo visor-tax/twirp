@@ -925,7 +925,7 @@ func (t *twirp) generateClient(name string, file *descriptor.FileDescriptorProto
 		t.P(`  out := new(`, outputType, `)`)
 		t.P(`  err := do`, name, `Request(ctx, c.client, c.urls[`, strconv.Itoa(i), `], in, out)`)
 		t.P(`  if err != nil {`)
-		t.P(`    return nil, err`)
+		t.P(`    return nil, twirp.InternalErrorWith(err)`)
 		t.P(`  }`)
 		t.P(`  return out, nil`)
 		t.P(`}`)
