@@ -2,7 +2,6 @@
 id: "headers"
 title: "Using custom HTTP Headers"
 sidebar_label: "Custom HTTP Headers"
-
 ---
 Sometimes, you need to send custom HTTP headers.
 
@@ -69,6 +68,7 @@ func (h *myServer) MyRPC(ctx context.Context, req *pb.Req) (*pb.Resp, error) {
   return &pb.Resp{}, nil
 }
 ```
+`twirp.AddHTTPResponseHeader` can be used to append values to a header.
 
 ### Read HTTP Headers from requests
 

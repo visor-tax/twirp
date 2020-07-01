@@ -114,22 +114,42 @@ func (t *twirp) Generate(in *plugin.CodeGeneratorRequest) *plugin.CodeGeneratorR
 	}
 	t.genPkgName = genPkgName
 
+	// We also need to figure out the fully import path of the package we're
+	// generating. It's possible to import proto definitions from different .proto
+	// files which will be generated into the same Go package, which we need to
+	// detect (and can only detect if files use fully-specified go_package
+	// options).
+	genPkgImportPath, _, _ := goPackageOption(t.genFiles[0])
+
 	// Next, we need to pick names for all the files that are dependencies.
 	for _, f := range in.ProtoFile {
+		// Is this is a file we are generating? If yes, it gets the shared package name.
 		if fileDescSliceContains(t.genFiles, f) {
-			// This is a file we are generating. It gets the shared package name.
 			t.fileToGoPackageName[f] = t.genPkgName
-		} else {
-			// This is a dependency. Use its package name.
-			name := f.GetPackage()
-			if name == "" {
-				name = stringutils.BaseName(f.GetName())
-			}
-			name = stringutils.CleanIdentifier(name)
-			alias := t.registerPackageName(name)
-			t.fileToGoPackageName[f] = alias
+			continue
 		}
+
+		// Is this is an imported .proto file which has the same fully-specified
+		// go_package as the targeted file for generation? If yes, it gets the
+		// shared package name too.
+		if genPkgImportPath != "" {
+			importPath, _, _ := goPackageOption(f)
+			if importPath == genPkgImportPath {
+				t.fileToGoPackageName[f] = t.genPkgName
+				continue
+			}
+		}
+
+		// This is a dependency from a different go_package. Use its package name.
+		name := f.GetPackage()
+		if name == "" {
+			name = stringutils.BaseName(f.GetName())
+		}
+		name = stringutils.CleanIdentifier(name)
+		alias := t.registerPackageName(name)
+		t.fileToGoPackageName[f] = alias
 	}
+
 	// Showtime! Generate the response.
 	resp := new(plugin.CodeGeneratorResponse)
 	for _, f := range t.genFiles {
@@ -309,8 +329,9 @@ func (t *twirp) generateImports(file *descriptor.FileDescriptorProto) {
 				}
 				importPath = t.importPrefix + importPath
 				pkg := t.goPackageName(def.File)
-				deps[pkg] = strconv.Quote(importPath)
-
+				if pkg != t.genPkgName {
+					deps[pkg] = strconv.Quote(importPath)
+				}
 			}
 		}
 	}
@@ -525,8 +546,11 @@ func (t *twirp) generateUtils() {
 	t.P(`  if err != nil {`)
 	t.P(`    return wrapInternal(err, "failed to read server error response body")`)
 	t.P(`  }`)
+	t.P(``)
 	t.P(`  var tj twerrJSON`)
-	t.P(`  if err := `, t.pkgs["json"], `.Unmarshal(respBodyBytes, &tj); err != nil {`)
+	t.P(`  dec := `, t.pkgs["json"], `.NewDecoder(`, t.pkgs["bytes"], `.NewReader(respBodyBytes))`)
+	t.P(`  dec.DisallowUnknownFields()`)
+	t.P(`  if err := dec.Decode(&tj); err != nil || tj.Code == "" {`)
 	t.P(`    // Invalid JSON response; it must be an error from an intermediary.`)
 	t.P(`    msg := `, t.pkgs["fmt"], `.Sprintf("Error from intermediary with HTTP status code %d %q", statusCode, statusText)`)
 	t.P(`    return twirpErrorFromIntermediary(statusCode, msg, string(respBodyBytes))`)
@@ -535,7 +559,7 @@ func (t *twirp) generateUtils() {
 	t.P(`  errorCode := `, t.pkgs["twirp"], `.ErrorCode(tj.Code)`)
 	t.P(`  if !`, t.pkgs["twirp"], `.IsValidErrorCode(errorCode) {`)
 	t.P(`    msg := "invalid type returned from server error response: "+tj.Code`)
-	t.P(`    return `, t.pkgs["twirp"], `.InternalError(msg)`)
+	t.P(`    return `, t.pkgs["twirp"], `.InternalError(msg).WithMeta("body", string(respBodyBytes))`)
 	t.P(`  }`)
 	t.P(``)
 	t.P(`  twerr := `, t.pkgs["twirp"], `.NewError(errorCode, tj.Msg)`)
@@ -596,8 +620,9 @@ func (t *twirp) generateUtils() {
 	t.P(`	prefix string`)
 	t.P(`	cause  error`)
 	t.P(`}`)
-	t.P(`func (e *wrappedError) Cause() error  { return e.cause }`)
 	t.P(`func (e *wrappedError) Error() string { return e.prefix + ": " + e.cause.Error() }`)
+	t.P(`func (e *wrappedError) Unwrap() error  { return e.cause } // for go1.13 + errors.Is/As `)
+	t.P(`func (e *wrappedError) Cause() error  { return e.cause } // for github.com/pkg/errors`)
 	t.P()
 
 	t.P(`// ensurePanicResponses makes sure that rpc methods causing a panic still result in a Twirp Internal`)
@@ -612,7 +637,7 @@ func (t *twirp) generateUtils() {
 	t.P(`		// Actually write the error`)
 	t.P(`		writeError(ctx, resp, twerr, hooks)`)
 	t.P(`		// If possible, flush the error to the wire.`)
-	t.P(`		f, ok := resp.(http.Flusher)`)
+	t.P(`		f, ok := resp.(`, t.pkgs["http"], `.Flusher)`)
 	t.P(`		if ok {`)
 	t.P(`			f.Flush()`)
 	t.P(`		}`)
@@ -629,13 +654,15 @@ func (t *twirp) generateUtils() {
 	t.P(`	return fmt.Errorf("panic: %v", p)`)
 	t.P(`}`)
 	t.P(``)
-	t.P(`// internalWithCause is a Twirp Internal error wrapping an original error cause, accessible`)
-	t.P(`// by github.com/pkg/errors.Cause, but the original error message is not exposed on Msg().`)
+	t.P(`// internalWithCause is a Twirp Internal error wrapping an original error cause,`)
+	t.P(`// but the original error message is not exposed on Msg(). The original error`)
+	t.P(`// can be checked with go1.13+ errors.Is/As, and also by (github.com/pkg/errors).Unwrap`)
 	t.P(`type internalWithCause struct {`)
 	t.P(`	msg    string`)
 	t.P(`	cause  error`)
 	t.P(`}`)
-	t.P(`func (e *internalWithCause) Cause() error  { return e.cause }`)
+	t.P(`func (e *internalWithCause) Unwrap() error  { return e.cause } // for go1.13 + errors.Is/As`)
+	t.P(`func (e *internalWithCause) Cause() error  { return e.cause } // for github.com/pkg/errors`)
 	t.P(`func (e *internalWithCause) Error() string { return e.msg + ": " + e.cause.Error()}`)
 	t.P(`func (e *internalWithCause) Code() `, t.pkgs["twirp"], `.ErrorCode { return `, t.pkgs["twirp"], `.Internal }`)
 	t.P(`func (e *internalWithCause) Msg() string                { return e.msg }`)
@@ -684,7 +711,7 @@ func (t *twirp) generateUtils() {
 	t.P()
 
 	t.P(`// doProtobufRequest makes a Protobuf request to the remote Twirp service.`)
-	t.P(`func doProtobufRequest(ctx `, t.pkgs["context"], `.Context, client HTTPClient, url string, in, out `, t.pkgs["proto"], `.Message) (err error) {`)
+	t.P(`func doProtobufRequest(ctx `, t.pkgs["context"], `.Context, client HTTPClient, hooks *`, t.pkgs["twirp"], `.ClientHooks, url string, in, out `, t.pkgs["proto"], `.Message) (err error) {`)
 	t.P(`  reqBodyBytes, err := `, t.pkgs["proto"], `.Marshal(in)`)
 	t.P(`  if err != nil {`)
 	t.P(`    return wrapInternal(err, "failed to marshal proto request")`)
@@ -698,6 +725,12 @@ func (t *twirp) generateUtils() {
 	t.P(`  if err != nil {`)
 	t.P(`    return wrapInternal(err, "could not build request")`)
 	t.P(`  }`)
+	t.P(`  ctx, err = callClientRequestPrepared(ctx, hooks, req)`)
+	t.P(`	 if err != nil {`)
+	t.P(`    return err`)
+	t.P(`  }`)
+	t.P()
+	t.P(`  req = req.WithContext(ctx)`)
 	t.P(`  resp, err := client.Do(req)`)
 	t.P(`  if err != nil {`)
 	t.P(`    return wrapInternal(err, "failed to do request")`)
@@ -734,7 +767,7 @@ func (t *twirp) generateUtils() {
 	t.P()
 
 	t.P(`// doJSONRequest makes a JSON request to the remote Twirp service.`)
-	t.P(`func doJSONRequest(ctx `, t.pkgs["context"], `.Context, client HTTPClient, url string, in, out `, t.pkgs["proto"], `.Message) (err error) {`)
+	t.P(`func doJSONRequest(ctx `, t.pkgs["context"], `.Context, client HTTPClient, hooks *`, t.pkgs["twirp"], `.ClientHooks, url string, in, out `, t.pkgs["proto"], `.Message) (err error) {`)
 	t.P(`  reqBody := `, t.pkgs["bytes"], `.NewBuffer(nil)`)
 	t.P(`  marshaler := &`, t.pkgs["jsonpb"], `.Marshaler{OrigName: true}`)
 	t.P(`  if err = marshaler.Marshal(reqBody, in); err != nil {`)
@@ -748,6 +781,12 @@ func (t *twirp) generateUtils() {
 	t.P(`  if err != nil {`)
 	t.P(`    return wrapInternal(err, "could not build request")`)
 	t.P(`  }`)
+	t.P(`  ctx, err = callClientRequestPrepared(ctx, hooks, req)`)
+	t.P(`	 if err != nil {`)
+	t.P(`    return err`)
+	t.P(`  }`)
+	t.P()
+	t.P(`  req = req.WithContext(ctx)`)
 	t.P(`  resp, err := client.Do(req)`)
 	t.P(`  if err != nil {`)
 	t.P(`    return wrapInternal(err, "failed to do request")`)
@@ -819,6 +858,8 @@ func (t *twirp) generateUtils() {
 	t.P(`  return h.Error(ctx, err)`)
 	t.P(`}`)
 	t.P()
+
+	t.generateClientHooks()
 }
 
 // P forwards to g.gen.P, which prints output.
@@ -892,11 +933,21 @@ func (t *twirp) generateClient(name string, file *descriptor.FileDescriptorProto
 	t.P(`type `, structName, ` struct {`)
 	t.P(`  client HTTPClient`)
 	t.P(`  urls   [`, methCnt, `]string`)
+	t.P(`  opts `, t.pkgs["twirp"], `.ClientOptions`)
 	t.P(`}`)
 	t.P()
 	t.P(`// `, newClientFunc, ` creates a `, name, ` client that implements the `, servName, ` interface.`)
 	t.P(`// It communicates using `, name, ` and can be configured with a custom HTTPClient.`)
-	t.P(`func `, newClientFunc, `(addr string, client HTTPClient) `, servName, ` {`)
+	t.P(`func `, newClientFunc, `(addr string, client HTTPClient, opts ...`, t.pkgs["twirp"], `.ClientOption) `, servName, ` {`)
+	t.P(`  if c, ok := client.(*`, t.pkgs["http"], `.Client); ok {`)
+	t.P(`    client = withoutRedirects(c)`)
+	t.P(`  }`)
+	t.P()
+	t.P(`  clientOpts := `, t.pkgs["twirp"], `.ClientOptions{}`)
+	t.P(`  for _, o := range opts {`)
+	t.P(`    o(&clientOpts)`)
+	t.P(`  }`)
+	t.P()
 	if len(service.Method) > 0 {
 		t.P(`  prefix := urlBase(addr) + `, pathPrefixConst)
 	}
@@ -905,15 +956,11 @@ func (t *twirp) generateClient(name string, file *descriptor.FileDescriptorProto
 		t.P(`    	prefix + "`, methodName(method), `",`)
 	}
 	t.P(`  }`)
-	t.P(`  if httpClient, ok := client.(*`, t.pkgs["http"], `.Client); ok {`)
-	t.P(`    return &`, structName, `{`)
-	t.P(`      client: withoutRedirects(httpClient),`)
-	t.P(`      urls:   urls,`)
-	t.P(`    }`)
-	t.P(`  }`)
+	t.P()
 	t.P(`  return &`, structName, `{`)
 	t.P(`    client: client,`)
 	t.P(`    urls:   urls,`)
+	t.P(`    opts: clientOpts,`)
 	t.P(`  }`)
 	t.P(`}`)
 	t.P()
@@ -929,14 +976,46 @@ func (t *twirp) generateClient(name string, file *descriptor.FileDescriptorProto
 		t.P(`  ctx = `, t.pkgs["ctxsetters"], `.WithServiceName(ctx, "`, servName, `")`)
 		t.P(`  ctx = `, t.pkgs["ctxsetters"], `.WithMethodName(ctx, "`, methName, `")`)
 		t.P(`  out := new(`, outputType, `)`)
-		t.P(`  err := do`, name, `Request(ctx, c.client, c.urls[`, strconv.Itoa(i), `], in, out)`)
+		t.P(`  err := do`, name, `Request(ctx, c.client, c.opts.Hooks, c.urls[`, strconv.Itoa(i), `], in, out)`)
 		t.P(`  if err != nil {`)
+		t.P(`    twerr, ok := err.(`, t.pkgs["twirp"], `.Error)`)
+		t.P(`    if !ok {`)
+		t.P(`      twerr = `, t.pkgs["twirp"], `.InternalErrorWith(err)`)
+		t.P(`    }`)
+		t.P(`    callClientError(ctx, c.opts.Hooks, twerr)`)
 		t.P(`    return nil, err`)
 		t.P(`  }`)
+		t.P()
+		t.P(`  callClientResponseReceived(ctx, c.opts.Hooks)`)
+		t.P()
 		t.P(`  return out, nil`)
 		t.P(`}`)
 		t.P()
 	}
+
+}
+
+func (t *twirp) generateClientHooks() {
+	t.P(`func callClientResponseReceived(ctx `, t.pkgs["context"], `.Context, h *`, t.pkgs["twirp"], `.ClientHooks) {`)
+	t.P(`  if h == nil || h.ResponseReceived == nil {`)
+	t.P(`    return`)
+	t.P(`  }`)
+	t.P(`  h.ResponseReceived(ctx)`)
+	t.P(`}`)
+	t.P()
+	t.P(`func callClientRequestPrepared(ctx `, t.pkgs["context"], `.Context, h *`, t.pkgs["twirp"], `.ClientHooks, req *`, t.pkgs["http"], `.Request) (`, t.pkgs["context"], `.Context, error) {`)
+	t.P(`  if h == nil || h.RequestPrepared == nil {`)
+	t.P(`    return ctx, nil`)
+	t.P(`  }`)
+	t.P(`  return h.RequestPrepared(ctx, req)`)
+	t.P(`}`)
+	t.P()
+	t.P(`func callClientError(ctx `, t.pkgs["context"], `.Context, h *`, t.pkgs["twirp"], `.ClientHooks, err `, t.pkgs["twirp"], `.Error) {`)
+	t.P(`  if h == nil || h.Error == nil {`)
+	t.P(`    return`)
+	t.P(`  }`)
+	t.P(`  h.Error(ctx, err)`)
+	t.P(`}`)
 }
 
 func (t *twirp) generateServer(file *descriptor.FileDescriptorProto, service *descriptor.ServiceDescriptorProto) {
